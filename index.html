@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#19183B" />
+  <title>SpinKu — Lucky Draw & Doorprize</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+  <script type="module" src="script.js"></script>
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#dashboard" aria-label="SpinKu beranda"><span class="brand-mark">S</span><span>SpinKu<small>LUCKY DRAW</small></span></a>
+      <div class="event-picker"><span class="eyebrow">ACARA AKTIF</span><strong id="sideEventName">Memuat acara…</strong><span class="status-pill"><i></i><span id="sideEventStatus">Menghubungkan</span></span></div>
+      <nav class="nav-list" aria-label="Navigasi utama">
+        <span class="nav-caption">MENU UTAMA</span>
+        <button class="nav-item active" data-page="dashboard"><span>▦</span>Dashboard</button>
+        <button class="nav-item" data-page="event"><span>⚙</span>Pengaturan acara</button>
+        <button class="nav-item" data-page="participants"><span>♙</span>Peserta</button>
+        <button class="nav-item" data-page="prizes"><span>◇</span>Hadiah</button>
+        <button class="nav-item" data-page="spinner"><span>◉</span>Pengaturan spinner</button>
+        <button class="nav-item" data-page="qrs"><span>▧</span>QR peserta</button>
+        <button class="nav-item" data-page="results"><span>✦</span>Hasil undian</button>
+        <button class="nav-item" data-page="history"><span>↻</span>Riwayat pemenang</button>
+      </nav>
+      <div class="sidebar-bottom"><div class="secure-note"><span>◈</span><div><strong>Undian aman</strong><small>Hasil ditentukan server</small></div></div><button class="text-button" id="organizerButton">Kunci akses panitia</button></div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar"><button id="menuToggle" class="icon-button mobile-menu" aria-label="Buka navigasi">☰</button><div class="crumb">SpinKu <span>/</span> <strong id="pageCrumb">Dashboard</strong></div><div class="top-actions"><span class="live-indicator"><i></i> Sinkronisasi aktif</span><button class="avatar" id="topAccess" title="Akses panitia">P</button></div></header>
+      <section id="notice" class="notice hidden" role="status"></section>
+      <section id="pageContent" class="content"></section>
+    </main>
+  </div>
+  <div id="modalRoot"></div>
+</body>
+</html>
