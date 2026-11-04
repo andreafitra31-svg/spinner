@@ -1,0 +1,11 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // All database access is performed by trusted Cloud Functions using the
+    // Admin SDK. Deny direct access from web and mobile clients.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
