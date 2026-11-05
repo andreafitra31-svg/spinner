@@ -10,10 +10,10 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 
 const firebaseConfig = {
-  apiKey: 'ISI_API_KEY',
-  authDomain: 'ISI_PROJECT_ID.firebaseapp.com',
-  projectId: 'ISI_PROJECT_ID',
-  appId: 'ISI_APP_ID'
+  apiKey: 'AIzaSyBFPwP-pGKlcFwy5y-UMymTv27TbyVM9VY',
+  authDomain: 'spinnerr-5f5f8.firebaseapp.com',
+  projectId: 'spinnerr-5f5f8',
+  appId: '1:577006432352:web:3b3b6e0e532757fe8ed305'
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
