@@ -12,16 +12,13 @@ const QR_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const randomToken = () => crypto.randomBytes(32).toString('base64url');
 const clean = value => typeof value === 'string' ? value.trim().slice(0, 500) : '';
-const normalize = value => value && typeof value.toDate === 'function' ? value.toDate().toISOString() : Array.isArray(value) ? value.map(normalize) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, normalize(v)])) : value;
+const normalize = value => value && typeof value.toDate === 'function' ? value.toDate().toISOString() : Array.isArray(value) ? value.map(normalize) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalize(item)])) : value;
 const fail = (code, message) => { throw new HttpsError(code, message); };
 const allowedOrganizerEmails = new Set((process.env.ORGANIZER_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
 
 async function organizer(data, request) {
   const user = request?.auth;
   if (!user || !user.uid) {
-    if (typeof data?.organizerToken === 'string' && data.organizerToken.length > 20) {
-      return { uid: 'legacy', email: 'legacy', sessionId: typeof data.sessionId === 'string' ? data.sessionId : '' };
-    }
     fail('unauthenticated', 'Masuk dengan email panitia terlebih dahulu.');
   }
 
@@ -282,4 +279,3 @@ exports.spinKuApi = onCall({ region: REGION, maxInstances: 20 }, async (request)
     throw error;
   }
 });
-
