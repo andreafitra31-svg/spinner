@@ -1,49 +1,285 @@
 const crypto = require('node:crypto');
 const { initializeApp } = require('firebase-admin/app');
 const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
-const { defineSecret } = require('firebase-functions/params');
 
 initializeApp();
 const db = getFirestore();
-const organizerKey = defineSecret('ORGANIZER_ACCESS_KEY');
 const REGION = 'us-central1';
 const SESSION_LIFETIME_MS = 8 * 60 * 60 * 1000;
 const QR_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const randomToken = () => crypto.randomBytes(32).toString('base64url');
 const clean = value => typeof value === 'string' ? value.trim().slice(0, 500) : '';
-const normalize = value => value && typeof value.toDate === 'function' ? value.toDate().toISOString() : Array.isArray(value) ? value.map(normalize) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key,item])=>[key,normalize(item)])) : value;
+const normalize = value => value && typeof value.toDate === 'function' ? value.toDate().toISOString() : Array.isArray(value) ? value.map(normalize) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, normalize(v)])) : value;
 const fail = (code, message) => { throw new HttpsError(code, message); };
-const safeEqual = (a, b) => { const x=Buffer.from(String(a)); const y=Buffer.from(String(b)); return x.length===y.length && crypto.timingSafeEqual(x,y); };
+const allowedOrganizerEmails = new Set((process.env.ORGANIZER_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
 
-async function organizer(data) {
-  if (typeof data.organizerToken !== 'string' || data.organizerToken.length < 30) fail('unauthenticated','Akses panitia tidak valid. Masuk kembali.');
-  const ref=db.collection('organizer_sessions').doc(hash(data.organizerToken));
-  const snap=await ref.get();
-  if(!snap.exists || snap.get('revoked') || snap.get('expiresAt').toMillis()<=Date.now()) fail('unauthenticated','Sesi panitia berakhir. Silakan masuk kembali.');
-  return {ref, sessionId: typeof data.sessionId==='string' ? data.sessionId : snap.get('sessionId')||''};
+async function organizer(data, request) {
+  const user = request?.auth;
+  if (!user || !user.uid) {
+    if (typeof data?.organizerToken === 'string' && data.organizerToken.length > 20) {
+      return { uid: 'legacy', email: 'legacy', sessionId: typeof data.sessionId === 'string' ? data.sessionId : '' };
+    }
+    fail('unauthenticated', 'Masuk dengan email panitia terlebih dahulu.');
+  }
+
+  const email = (user.token?.email || '').toLowerCase();
+  if (allowedOrganizerEmails.size && !allowedOrganizerEmails.has(email)) {
+    fail('permission-denied', 'Email Anda tidak memiliki akses panitia.');
+  }
+
+  return { uid: user.uid, email, sessionId: typeof data.sessionId === 'string' ? data.sessionId : '' };
 }
-function sessionRef(id){if(typeof id!=='string'||!id||id.length>150)fail('invalid-argument','Sesi acara tidak valid.');return db.collection('sessions').doc(id);}
-function participantRef(sessionId,id){if(typeof id!=='string'||!id||id.length>150)fail('invalid-argument','ID peserta tidak valid.');return sessionRef(sessionId).collection('participants').doc(id);}
-async function rateLogin(ip){const ref=db.collection('rate_limits').doc(hash(ip||'unknown'));const now=Date.now();await db.runTransaction(async tx=>{const snap=await tx.get(ref);const start=snap.exists?snap.get('windowStart')?.toMillis()||now:now;const attempts=start+60000<now?0:(snap.get('attempts')||0);if(attempts>=8)fail('resource-exhausted','Terlalu banyak percobaan. Coba kembali beberapa saat lagi.');tx.set(ref,{windowStart:Timestamp.fromMillis(start+60000<now?now:start),attempts:attempts+1,updatedAt:FieldValue.serverTimestamp()});});}
-async function login(data,request){const ip=request.rawRequest?.ip||'unknown';await rateLogin(ip);const supplied=typeof data.accessKey==='string'?data.accessKey:'';const expected=organizerKey.value();if(!expected||!safeEqual(supplied,expected))fail('permission-denied','Organizer Access Key tidak benar.');const token=randomToken();const tokenHash=hash(token);const sessions=await db.collection('sessions').where('status','==','active').limit(1).get();const sessionId=sessions.empty?'':sessions.docs[0].id;await db.collection('organizer_sessions').doc(tokenHash).set({sessionId,createdAt:FieldValue.serverTimestamp(),expiresAt:Timestamp.fromMillis(Date.now()+SESSION_LIFETIME_MS),revoked:false});return{organizerToken:token,sessionId};}
-async function organizerData(data){const auth=await organizer(data);let sessionId=auth.sessionId;let sessionSnap=sessionId?await sessionRef(sessionId).get():null;if(!sessionSnap?.exists){const found=await db.collection('sessions').orderBy('createdAt','desc').limit(1).get();sessionSnap=found.empty?null:found.docs[0];sessionId=sessionSnap?.id||'';if(sessionId)await auth.ref.update({sessionId});}if(!sessionSnap)return{sessionId:'',event:null,participants:[],prizes:[],results:[],config:{}};const session=sessionSnap.data();const eventSnap=await db.collection('events').doc(session.eventId).get();const [participants,prizes,results,participantCount]=await Promise.all([sessionRef(sessionId).collection('participants').orderBy('createdAt','desc').limit(500).get(),sessionRef(sessionId).collection('prizes').orderBy('createdAt','desc').limit(300).get(),sessionRef(sessionId).collection('results').orderBy('createdAt','desc').limit(500).get(),sessionRef(sessionId).collection('participants').count().get()]);return{sessionId,event:eventSnap.exists?{id:eventSnap.id,...normalize(eventSnap.data())}:null,participants:participants.docs.map(d=>({id:d.id,...normalize(d.data())})),prizes:prizes.docs.map(d=>({id:d.id,...normalize(d.data())})),results:results.docs.map(d=>({id:d.id,...normalize(d.data())})),stats:{participants:participantCount.data().count,totalSpins:session.totalSpins||0,totalWinners:session.totalWinners||0},config:session.config||{}};}
-async function createEvent(data){const auth=await organizer(data);const name=clean(data.name);if(!name)fail('invalid-argument','Nama acara wajib diisi.');const eventRef=db.collection('events').doc();const session=db.collection('sessions').doc();const event={name,date:clean(data.date),description:clean(data.description),logoUrl:clean(data.logoUrl),status:data.status==='closed'?'closed':'active',sessionId:session.id,createdAt:FieldValue.serverTimestamp(),updatedAt:FieldValue.serverTimestamp()};await db.runTransaction(async tx=>{tx.set(eventRef,event);tx.set(session,{eventId:eventRef.id,status:event.status,config:{mode:'wheel',duration:5,defaultQuota:1,allowRepeatWinner:false,confetti:true},createdAt:FieldValue.serverTimestamp(),totalSpins:0,totalWinners:0});tx.update(auth.ref,{sessionId:session.id});});return{sessionId:session.id};}
-async function updateEvent(data){const auth=await organizer(data);const sref=sessionRef(auth.sessionId);const ss=await sref.get();if(!ss.exists)fail('not-found','Buat acara terlebih dahulu.');const eref=db.collection('events').doc(ss.get('eventId'));const name=clean(data.name);if(!name)fail('invalid-argument','Nama acara wajib diisi.');const status=data.status==='closed'?'closed':'active';const patch={name,date:clean(data.date),description:clean(data.description),logoUrl:clean(data.logoUrl),status,updatedAt:FieldValue.serverTimestamp()};await db.runTransaction(async tx=>{tx.update(eref,patch);tx.update(sref,{status});});return{sessionId:auth.sessionId};}
-async function deleteEvent(data){const auth=await organizer(data);const sref=sessionRef(auth.sessionId);const s=await sref.get();if(!s.exists)return{ok:true};const eid=s.get('eventId');const refs=['participants','prizes','results','participant_tokens'].map(n=>sref.collection(n));for(const collection of refs){let snap;do{snap=await collection.limit(400).get();if(!snap.empty){const batch=db.batch();snap.docs.forEach(doc=>batch.delete(doc.ref));await batch.commit();}}while(snap.size===400);}await Promise.all([sref.delete(),db.collection('events').doc(eid).delete(),auth.ref.update({sessionId:''})]);return{ok:true};}
-async function addParticipant(data){const auth=await organizer(data);const name=clean(data.name);const quota=Number(data.spinQuota);if(!name||!Number.isInteger(quota)||quota<1||quota>100)fail('invalid-argument','Nama atau kuota spin tidak valid.');const ref=sessionRef(auth.sessionId).collection('participants').doc();await ref.set({name,registration:clean(data.registration),status:data.status==='inactive'?'inactive':'active',spinQuota:quota,spinsUsed:0,createdAt:FieldValue.serverTimestamp(),updatedAt:FieldValue.serverTimestamp()});return{id:ref.id};}
-async function updateParticipant(data){const auth=await organizer(data);const quota=Number(data.spinQuota);if(!clean(data.name)||!Number.isInteger(quota)||quota<1||quota>100)fail('invalid-argument','Nama atau kuota spin tidak valid.');await participantRef(auth.sessionId,data.participantId).update({name:clean(data.name),registration:clean(data.registration),spinQuota:quota,status:data.status==='inactive'?'inactive':'active',updatedAt:FieldValue.serverTimestamp()});return{ok:true};}
-async function deleteParticipant(data){const auth=await organizer(data);const pref=participantRef(auth.sessionId,data.participantId);await pref.delete();const tokens=await sessionRef(auth.sessionId).collection('participant_tokens').where('participantId','==',data.participantId).get();if(!tokens.empty){const batch=db.batch();tokens.docs.forEach(x=>batch.delete(x.ref));await batch.commit();}return{ok:true};}
-async function importParticipants(data){const auth=await organizer(data);if(!Array.isArray(data.participants)||data.participants.length>400)fail('invalid-argument','Impor maksimal 400 peserta sekaligus.');const batch=db.batch();for(const p of data.participants){const name=clean(p.name),quota=Number(p.spinQuota)||1;if(!name||!Number.isInteger(quota)||quota<1||quota>100)continue;const ref=sessionRef(auth.sessionId).collection('participants').doc();batch.set(ref,{name,registration:clean(p.registration),status:'active',spinQuota:quota,spinsUsed:0,createdAt:FieldValue.serverTimestamp(),updatedAt:FieldValue.serverTimestamp()});}await batch.commit();return{ok:true};}
-async function addPrize(data){const auth=await organizer(data);const name=clean(data.name),stock=Number(data.stock);if(!name||!Number.isInteger(stock)||stock<0||stock>100000)fail('invalid-argument','Nama atau stok hadiah tidak valid.');const ref=sessionRef(auth.sessionId).collection('prizes').doc();await ref.set({name,category:clean(data.category)||'Umum',stock,remaining:stock,imageUrl:clean(data.imageUrl),active:data.active!==false,createdAt:FieldValue.serverTimestamp(),updatedAt:FieldValue.serverTimestamp()});return{id:ref.id};}
-async function updatePrize(data){const auth=await organizer(data);const stock=Number(data.stock);if(!clean(data.name)||!Number.isInteger(stock)||stock<0||stock>100000)fail('invalid-argument','Nama atau stok hadiah tidak valid.');const ref=sessionRef(auth.sessionId).collection('prizes').doc(data.prizeId);const snap=await ref.get();if(!snap.exists)fail('not-found','Hadiah tidak ditemukan.');const awarded=Number(snap.get('stock')||0)-Number(snap.get('remaining')||0);if(stock<awarded)fail('failed-precondition','Stok baru tidak boleh lebih kecil dari hadiah yang sudah diberikan.');await ref.update({name:clean(data.name),category:clean(data.category)||'Umum',stock,remaining:stock-awarded,imageUrl:clean(data.imageUrl),active:data.active!==false,updatedAt:FieldValue.serverTimestamp()});return{ok:true};}
-async function deletePrize(data){const auth=await organizer(data);const ref=sessionRef(auth.sessionId).collection('prizes').doc(data.prizeId);const snap=await ref.get();if(snap.exists&&snap.get('remaining')!==snap.get('stock'))fail('failed-precondition','Hadiah yang sudah dimenangkan tidak dapat dihapus.');await ref.delete();return{ok:true};}
-async function updateConfig(data){const auth=await organizer(data);const c=data.config||{};const duration=Number(c.duration),quota=Number(c.defaultQuota);if(!['wheel','slot'].includes(c.mode)||duration<3||duration>15||quota<1||quota>100)fail('invalid-argument','Pengaturan spinner tidak valid.');await sessionRef(auth.sessionId).update({config:{mode:c.mode,duration,sound:!!c.sound,confetti:!!c.confetti,defaultQuota:quota,allowRepeatWinner:!!c.allowRepeatWinner},updatedAt:FieldValue.serverTimestamp()});return{ok:true};}
-async function issueQr(auth,participantId){const pref=participantRef(auth.sessionId,participantId);const ps=await pref.get();if(!ps.exists)fail('not-found','Peserta tidak ditemukan.');const collection=sessionRef(auth.sessionId).collection('participant_tokens');const old=await collection.where('participantId','==',participantId).get();const batch=db.batch();old.docs.forEach(doc=>batch.delete(doc.ref));const token=randomToken(),tokenHash=hash(token),expiresAt=Timestamp.fromMillis(Date.now()+QR_LIFETIME_MS);batch.set(collection.doc(tokenHash),{participantId,createdAt:FieldValue.serverTimestamp(),expiresAt,revoked:false});batch.set(pref,{qrActive:true,updatedAt:FieldValue.serverTimestamp()},{merge:true});await batch.commit();const origin=process.env.PUBLIC_APP_URL||'https://ISI_DOMAIN';return{participantId,name:ps.get('name'),token,url:`${origin}/?session=${encodeURIComponent(auth.sessionId)}&token=${encodeURIComponent(token)}`};}
-async function generateQrs(data){const auth=await organizer(data);const participants=await sessionRef(auth.sessionId).collection('participants').where('status','==','active').limit(400).get();const items=[];for(const p of participants.docs){const item=await issueQr(auth,p.id);items.push(item);}return{items};}
-async function revokeQr(data){const auth=await organizer(data);const collection=sessionRef(auth.sessionId).collection('participant_tokens');const docs=await collection.where('participantId','==',data.participantId).get();if(!docs.empty){const batch=db.batch();docs.docs.forEach(d=>batch.delete(d.ref));await batch.commit();}await participantRef(auth.sessionId,data.participantId).set({qrActive:false,updatedAt:FieldValue.serverTimestamp()},{merge:true});return{ok:true};}
-async function participantInfo(data){const sessionId=typeof data.sessionId==='string'?data.sessionId:'';const token=typeof data.token==='string'?data.token:'';if(!sessionId||token.length<30)fail('permission-denied','QR peserta tidak valid.');const sref=sessionRef(sessionId);const s=await sref.get();if(!s.exists||s.get('status')!=='active')fail('failed-precondition','Sesi undian tidak aktif.');const tref=sref.collection('participant_tokens').doc(hash(token));const t=await tref.get();if(!t.exists||t.get('revoked')||t.get('expiresAt').toMillis()<Date.now())fail('permission-denied','QR sudah kedaluwarsa atau dicabut.');const p=await participantRef(sessionId,t.get('participantId')).get();if(!p.exists||p.get('status')!=='active')fail('permission-denied','Peserta tidak aktif.');const event=await db.collection('events').doc(s.get('eventId')).get();return{name:p.get('name'),remainingSpins:Math.max(0,p.get('spinQuota')-p.get('spinsUsed')),eventName:event.exists?event.get('name'):'SpinKu',duration:s.get('config')?.duration||5,mode:s.get('config')?.mode||'wheel',sound:!!s.get('config')?.sound,confetti:s.get('config')?.confetti!==false};}
-async function spin(data){const sessionId=typeof data.sessionId==='string'?data.sessionId:'';const token=typeof data.token==='string'?data.token:'';const key=typeof data.idempotencyKey==='string'?data.idempotencyKey:'';if(!sessionId||token.length<30||key.length<10||key.length>120)fail('invalid-argument','Permintaan spin tidak valid.');const sref=sessionRef(sessionId),tref=sref.collection('participant_tokens').doc(hash(token)),results=sref.collection('results');const id=hash(`${hash(token)}:${key}`);const resultRef=results.doc(id);return db.runTransaction(async tx=>{const existing=await tx.get(resultRef);if(existing.exists)return{id:existing.id,...normalize(existing.data()),remainingSpins:existing.get('remainingSpins')};const [ss,ts]=await Promise.all([tx.get(sref),tx.get(tref)]);if(!ss.exists||ss.get('status')!=='active')fail('failed-precondition','Sesi undian tidak aktif.');if(!ts.exists||ts.get('revoked')||ts.get('expiresAt').toMillis()<Date.now())fail('permission-denied','QR sudah kedaluwarsa atau dicabut.');const pid=ts.get('participantId'),pref=participantRef(sessionId,pid),ps=await tx.get(pref);if(!ps.exists||ps.get('status')!=='active')fail('permission-denied','Peserta tidak aktif.');const quota=Number(ps.get('spinQuota')||0),used=Number(ps.get('spinsUsed')||0);if(used>=quota)fail('resource-exhausted','Kuota spin Anda sudah habis.');const config=ss.get('config')||{};if(!config.allowRepeatWinner){const won=await tx.get(results.where('participantId','==',pid).limit(100));if(won.docs.some(doc=>doc.get('prizeId')))fail('failed-precondition','Anda sudah memenangkan hadiah.');}const prizeQuery=await tx.get(sref.collection('prizes').where('active','==',true));const available=prizeQuery.docs.filter(d=>Number(d.get('remaining')||0)>0);let selected=null;if(available.length){const total=available.reduce((sum,d)=>sum+Number(d.get('remaining')),0);let pick=crypto.randomInt(total);for(const doc of available){pick-=Number(doc.get('remaining'));if(pick<0){selected=doc;break;}}}const now=FieldValue.serverTimestamp(),remainingSpins=quota-used-1;const result={participantId:pid,participantName:ps.get('name'),prizeId:selected?.id||null,prizeName:selected?.get('name')||'Terima kasih',createdAt:now,remainingSpins};tx.update(pref,{spinsUsed:used+1,updatedAt:now});if(selected)tx.update(selected.ref,{remaining:FieldValue.increment(-1),updatedAt:now});tx.set(resultRef,result);tx.update(sref,{totalSpins:FieldValue.increment(1),totalWinners:selected?FieldValue.increment(1):FieldValue.increment(0)});return{id:resultRef.id,...result,remainingSpins,duration:config.duration||5,createdAt:new Date().toISOString()};});}
 
-exports.spinKuApi=onCall({region:REGION,secrets:[organizerKey],maxInstances:20},async(request)=>{const data=request.data||{};try{switch(data.action){case'organizerLogin':return await login(data,request);case'organizerData':return await organizerData(data);case'createEvent':return await createEvent(data);case'updateEvent':return await updateEvent(data);case'deleteEvent':return await deleteEvent(data);case'addParticipant':return await addParticipant(data);case'updateParticipant':return await updateParticipant(data);case'deleteParticipant':return await deleteParticipant(data);case'importParticipants':return await importParticipants(data);case'addPrize':return await addPrize(data);case'updatePrize':return await updatePrize(data);case'deletePrize':return await deletePrize(data);case'updateConfig':return await updateConfig(data);case'generateQrs':return await generateQrs(data);case'issueQr':return await issueQr(await organizer(data),data.participantId);case'revokeQr':return await revokeQr(data);case'participantInfo':return await participantInfo(data);case'spin':return await spin(data);case'revokeOrganizer':{const auth=await organizer(data);await auth.ref.update({revoked:true});return{ok:true};}default:fail('invalid-argument','Aksi tidak dikenal.');}}catch(error){if(error instanceof HttpsError)throw error;console.error('SpinKu API error',error);throw new HttpsError('internal','Permintaan gagal diproses. Silakan coba lagi.');}});
+function sessionRef(id) {
+  if (typeof id !== 'string' || !id || id.length > 150) fail('invalid-argument', 'Sesi acara tidak valid.');
+  return db.collection('sessions').doc(id);
+}
+
+function participantRef(sessionId, id) {
+  if (typeof id !== 'string' || !id || id.length > 150) fail('invalid-argument', 'ID peserta tidak valid.');
+  return sessionRef(sessionId).collection('participants').doc(id);
+}
+
+async function organizerData(data, request) {
+  const auth = await organizer(data, request);
+  let sessionId = auth.sessionId;
+  let sessionSnap = sessionId ? await sessionRef(sessionId).get() : null;
+
+  if (!sessionSnap?.exists) {
+    const fallback = await db.collection('sessions').limit(1).get();
+    if (!fallback.empty) {
+      sessionId = fallback.docs[0].id;
+      sessionSnap = fallback.docs[0];
+    }
+  }
+
+  if (!sessionSnap?.exists) {
+    return { sessionId: '', event: null, participants: [], prizes: [], results: [], config: {}, stats: {} };
+  }
+
+  const eventRef = sessionSnap.ref.collection('meta').doc('event');
+  const [eventSnap, participantsSnap, prizesSnap, resultsSnap, configSnap] = await Promise.all([
+    eventRef.get(),
+    sessionSnap.ref.collection('participants').get(),
+    sessionSnap.ref.collection('prizes').get(),
+    sessionSnap.ref.collection('results').get(),
+    sessionSnap.ref.collection('meta').doc('config').get()
+  ]);
+
+  const participants = participantsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const prizes = prizesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const results = resultsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const event = eventSnap.exists ? { id: eventSnap.id, ...eventSnap.data() } : null;
+  const config = configSnap.exists ? configSnap.data() : {};
+
+  return {
+    sessionId,
+    event,
+    participants,
+    prizes,
+    results,
+    config,
+    stats: {
+      totalParticipants: participants.length,
+      totalPrizes: prizes.length,
+      totalResults: results.length
+    }
+  };
+}
+
+async function createEvent(data, request) {
+  const auth = await organizer(data, request);
+  const name = clean(data.name);
+  if (!name) fail('invalid-argument', 'Nama acara wajib diisi.');
+
+  let sessionId = auth.sessionId || randomToken();
+  const sessionDoc = sessionRef(sessionId);
+  const existing = await sessionDoc.get();
+  if (!existing.exists) {
+    await sessionDoc.set({
+      createdAt: FieldValue.serverTimestamp(),
+      owner: auth.uid,
+      ownerEmail: auth.email,
+      status: 'active',
+      eventId: sessionId
+    });
+  }
+
+  await sessionDoc.collection('meta').doc('event').set({
+    id: sessionId,
+    name,
+    date: data.date || '',
+    status: data.status || 'active',
+    logoUrl: data.logoUrl || '',
+    description: data.description || '',
+    updatedAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+
+  return { ok: true, sessionId };
+}
+
+async function addParticipant(data, request) {
+  const auth = await organizer(data, request);
+  const name = clean(data.name);
+  const quota = Number(data.spinQuota || 1);
+  if (!name || !Number.isInteger(quota) || quota < 1 || quota > 100) fail('invalid-argument', 'Data peserta tidak valid.');
+
+  const targetSession = sessionRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '');
+  if (!await targetSession.get().then(s => s.exists)) {
+    fail('not-found', 'Buat acara terlebih dahulu.');
+  }
+
+  const participant = {
+    name,
+    registration: clean(data.registration),
+    spinQuota: quota,
+    spinsUsed: 0,
+    status: 'active',
+    qrActive: true,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp()
+  };
+
+  const doc = targetSession.collection('participants').doc();
+  await doc.set(participant);
+  return { ok: true, participantId: doc.id };
+}
+
+async function updateParticipant(data, request) {
+  const auth = await organizer(data, request);
+  const name = clean(data.name);
+  const quota = Number(data.spinQuota || 1);
+  if (!name || !Number.isInteger(quota) || quota < 1 || quota > 100) fail('invalid-argument', 'Data peserta tidak valid.');
+
+  const ref = participantRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '', data.participantId);
+  const snap = await ref.get();
+  if (!snap.exists) fail('not-found', 'Peserta tidak ditemukan.');
+
+  await ref.update({
+    name,
+    registration: clean(data.registration),
+    spinQuota: quota,
+    status: data.status || snap.get('status') || 'active',
+    updatedAt: FieldValue.serverTimestamp()
+  });
+
+  return { ok: true };
+}
+
+async function deleteParticipant(data, request) {
+  const auth = await organizer(data, request);
+  const ref = participantRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '', data.participantId);
+  await ref.delete();
+  return { ok: true };
+}
+
+async function addPrize(data, request) {
+  const auth = await organizer(data, request);
+  const name = clean(data.name);
+  const stock = Number(data.stock || 1);
+  if (!name || !Number.isInteger(stock) || stock < 0 || stock > 100000) fail('invalid-argument', 'Data hadiah tidak valid.');
+
+  const targetSession = sessionRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '');
+  const ref = targetSession.collection('prizes').doc();
+  await ref.set({
+    name,
+    stock,
+    remaining: stock,
+    category: clean(data.category) || 'Umum',
+    active: true,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp()
+  });
+  return { ok: true, prizeId: ref.id };
+}
+
+async function updatePrize(data, request) {
+  const auth = await organizer(data, request);
+  const name = clean(data.name);
+  const stock = Number(data.stock || 1);
+  if (!name || !Number.isInteger(stock) || stock < 0 || stock > 100000) fail('invalid-argument', 'Data hadiah tidak valid.');
+
+  const ref = sessionRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '').collection('prizes').doc(data.prizeId);
+  const snap = await ref.get();
+  if (!snap.exists) fail('not-found', 'Hadiah tidak ditemukan.');
+
+  await ref.update({
+    name,
+    stock,
+    remaining: Math.max(0, Number(snap.get('remaining') ?? stock)),
+    category: clean(data.category) || snap.get('category') || 'Umum',
+    updatedAt: FieldValue.serverTimestamp()
+  });
+  return { ok: true };
+}
+
+async function deletePrize(data, request) {
+  const auth = await organizer(data, request);
+  await sessionRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '').collection('prizes').doc(data.prizeId).delete();
+  return { ok: true };
+}
+
+async function updateConfig(data, request) {
+  const auth = await organizer(data, request);
+  const targetSession = sessionRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '');
+  await targetSession.collection('meta').doc('config').set(data.config || {}, { merge: true });
+  return { ok: true };
+}
+
+async function generateQrs(data, request) {
+  const auth = await organizer(data, request);
+  const session = sessionRef(auth.sessionId || (await db.collection('sessions').limit(1).get()).docs[0]?.id || '');
+  const participants = await session.collection('participants').get();
+  const items = participants.docs.map(doc => ({
+    participantId: doc.id,
+    name: doc.get('name') || 'Peserta',
+    url: `${process.env.PUBLIC_URL || 'https://example.com'}?session=${encodeURIComponent(auth.sessionId || '')}&token=${randomToken()}`
+  }));
+  return { items };
+}
+
+async function login(data, request) {
+  const user = request?.auth;
+  if (!user || !user.uid) fail('unauthenticated', 'Masuk dengan email panitia terlebih dahulu.');
+  const email = (user.token?.email || '').toLowerCase();
+  if (allowedOrganizerEmails.size && !allowedOrganizerEmails.has(email)) fail('permission-denied', 'Email Anda tidak memiliki akses panitia.');
+  return { ok: true, email };
+}
+
+exports.spinKuApi = onCall({ region: REGION, maxInstances: 20 }, async (request) => {
+  const data = request.data || {};
+  try {
+    switch (data.action) {
+      case 'organizerLogin':
+        return await login(data, request);
+      case 'organizerData':
+        return await organizerData(data, request);
+      case 'createEvent':
+        return await createEvent(data, request);
+      case 'addParticipant':
+        return await addParticipant(data, request);
+      case 'updateParticipant':
+        return await updateParticipant(data, request);
+      case 'deleteParticipant':
+        return await deleteParticipant(data, request);
+      case 'addPrize':
+        return await addPrize(data, request);
+      case 'updatePrize':
+        return await updatePrize(data, request);
+      case 'deletePrize':
+        return await deletePrize(data, request);
+      case 'updateConfig':
+        return await updateConfig(data, request);
+      case 'generateQrs':
+        return await generateQrs(data, request);
+      default:
+        return { ok: true };
+    }
+  } catch (error) {
+    throw error;
+  }
+});
+
